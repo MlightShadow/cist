@@ -1,10 +1,9 @@
-# Copyright (c) 2015-2016 Anish Athalye. Released under GPLv3.
+# Copyright (c) 2015-2018 Anish Athalye. Released under GPLv3.
 
 import os
 
 import numpy as np
 import imageio
-import scipy.misc
 from skimage import transform
 
 from stylize import stylize
@@ -12,14 +11,24 @@ from stylize import stylize
 import math
 from argparse import ArgumentParser
 
+import re
+from collections import OrderedDict
+from PIL import Image
+
 # default arguments
 CONTENT_WEIGHT = 5e0
-STYLE_WEIGHT = 1e2
+CONTENT_WEIGHT_BLEND = 1
+STYLE_WEIGHT = 5e2
 TV_WEIGHT = 1e2
-LEARNING_RATE = 1e2
+STYLE_LAYER_WEIGHT_EXP = 1
+LEARNING_RATE = 1e1
+BETA1 = 0.9
+BETA2 = 0.999
+EPSILON = 1e-08
 STYLE_SCALE = 1.0
 ITERATIONS = 1000
-VGG_PATH = './imagenet-vgg-verydeep-19.mat'
+VGG_PATH = 'imagenet-vgg-verydeep-19.mat'
+POOLING = 'max'
 
 
 def build_parser():
@@ -34,12 +43,26 @@ def build_parser():
     parser.add_argument('--output',
             dest='output', help='output path',
             metavar='OUTPUT', required=True)
-    parser.add_argument('--checkpoint-output',
-            dest='checkpoint_output', help='checkpoint output format',
-            metavar='OUTPUT')
     parser.add_argument('--iterations', type=int,
             dest='iterations', help='iterations (default %(default)s)',
             metavar='ITERATIONS', default=ITERATIONS)
+    parser.add_argument('--print-iterations', type=int,
+            dest='print_iterations', help='statistics printing frequency',
+            metavar='PRINT_ITERATIONS')
+    parser.add_argument('--checkpoint-output',
+            dest='checkpoint_output',
+            help='checkpoint output format, e.g. output_{:05}.jpg or '
+                 'output_%%05d.jpg',
+            metavar='OUTPUT', default=None)
+    parser.add_argument('--checkpoint-iterations', type=int,
+            dest='checkpoint_iterations', help='checkpoint frequency',
+            metavar='CHECKPOINT_ITERATIONS', default=None)
+    parser.add_argument('--progress-write', default=False, action='store_true',
+            help="write iteration progess data to OUTPUT's dir",
+            required=False)
+    parser.add_argument('--progress-plot', default=False, action='store_true',
+            help="plot iteration progess data to OUTPUT's dir",
+            required=False)
     parser.add_argument('--width', type=int,
             dest='width', help='output width',
             metavar='WIDTH')
@@ -50,39 +73,97 @@ def build_parser():
     parser.add_argument('--network',
             dest='network', help='path to network parameters (default %(default)s)',
             metavar='VGG_PATH', default=VGG_PATH)
+    parser.add_argument('--content-weight-blend', type=float,
+            dest='content_weight_blend',
+            help='content weight blend, conv4_2 * blend + conv5_2 * (1-blend) '
+                 '(default %(default)s)',
+            metavar='CONTENT_WEIGHT_BLEND', default=CONTENT_WEIGHT_BLEND)
     parser.add_argument('--content-weight', type=float,
             dest='content_weight', help='content weight (default %(default)s)',
             metavar='CONTENT_WEIGHT', default=CONTENT_WEIGHT)
     parser.add_argument('--style-weight', type=float,
             dest='style_weight', help='style weight (default %(default)s)',
             metavar='STYLE_WEIGHT', default=STYLE_WEIGHT)
+    parser.add_argument('--style-layer-weight-exp', type=float,
+            dest='style_layer_weight_exp',
+            help='style layer weight exponentional increase - '
+                 'weight(layer<n+1>) = weight_exp*weight(layer<n>) '
+                 '(default %(default)s)',
+            metavar='STYLE_LAYER_WEIGHT_EXP', default=STYLE_LAYER_WEIGHT_EXP)
     parser.add_argument('--style-blend-weights', type=float,
             dest='style_blend_weights', help='style blending weights',
             nargs='+', metavar='STYLE_BLEND_WEIGHT')
     parser.add_argument('--tv-weight', type=float,
-            dest='tv_weight', help='total variation regularization weight (default %(default)s)',
+            dest='tv_weight',
+            help='total variation regularization weight (default %(default)s)',
             metavar='TV_WEIGHT', default=TV_WEIGHT)
     parser.add_argument('--learning-rate', type=float,
             dest='learning_rate', help='learning rate (default %(default)s)',
             metavar='LEARNING_RATE', default=LEARNING_RATE)
+    parser.add_argument('--beta1', type=float,
+            dest='beta1', help='Adam: beta1 parameter (default %(default)s)',
+            metavar='BETA1', default=BETA1)
+    parser.add_argument('--beta2', type=float,
+            dest='beta2', help='Adam: beta2 parameter (default %(default)s)',
+            metavar='BETA2', default=BETA2)
+    parser.add_argument('--eps', type=float,
+            dest='epsilon', help='Adam: epsilon parameter (default %(default)s)',
+            metavar='EPSILON', default=EPSILON)
     parser.add_argument('--initial',
             dest='initial', help='initial image',
             metavar='INITIAL')
-    parser.add_argument('--print-iterations', type=int,
-            dest='print_iterations', help='statistics printing frequency',
-            metavar='PRINT_ITERATIONS')
-    parser.add_argument('--checkpoint-iterations', type=int,
-            dest='checkpoint_iterations', help='checkpoint frequency',
-            metavar='CHECKPOINT_ITERATIONS')
+    parser.add_argument('--initial-noiseblend', type=float,
+            dest='initial_noiseblend',
+            help='ratio of blending initial image with normalized noise '
+                 '(if no initial image specified, content image is used) '
+                 '(default %(default)s)',
+            metavar='INITIAL_NOISEBLEND')
+    parser.add_argument('--preserve-colors', action='store_true',
+            dest='preserve_colors',
+            help='style-only transfer (preserving colors) - if color transfer '
+                 'is not needed')
+    parser.add_argument('--pooling',
+            dest='pooling',
+            help='pooling layer configuration: max or avg (default %(default)s)',
+            metavar='POOLING', default=POOLING)
+    parser.add_argument('--overwrite', action='store_true', dest='overwrite',
+            help='write file even if there is already a file with that name')
     return parser
 
 
+def fmt_imsave(fmt, iteration):
+    if re.match(r'^.*\{.*\}.*$', fmt):
+        return fmt.format(iteration)
+    elif '%' in fmt:
+        return fmt % iteration
+    else:
+        raise ValueError("illegal format string '{}'".format(fmt))
+
+
 def main():
+
+    # https://stackoverflow.com/a/42121886
+    key = 'TF_CPP_MIN_LOG_LEVEL'
+    if key not in os.environ:
+        os.environ[key] = '2'
+
     parser = build_parser()
     options = parser.parse_args()
 
     if not os.path.isfile(options.network):
-        parser.error("Network %s does not exist. (Did you forget to download it?)" % options.network)
+        parser.error("Network %s does not exist. (Did you forget to "
+                     "download it?)" % options.network)
+
+    if [options.checkpoint_iterations,
+        options.checkpoint_output].count(None) == 1:
+        parser.error("use either both of checkpoint_output and "
+                     "checkpoint_iterations or neither")
+
+    if options.checkpoint_output is not None:
+        if re.match(r'^.*(\{.*\}|%.*).*$', options.checkpoint_output) is None:
+            parser.error("To save intermediate images, the checkpoint_output "
+                         "parameter must contain placeholders (e.g. "
+                         "`foo_{}.jpg` or `foo_%d.jpg`")
 
     content_image = imread(options.content)
     style_images = [imread(style) for style in options.styles]
@@ -112,11 +193,28 @@ def main():
     initial = options.initial
     if initial is not None:
         initial = transform.rescale(imread(initial), content_image.shape[:2])
+        # Initial guess is specified, but not noiseblend - no noise should be blended
+        if options.initial_noiseblend is None:
+            options.initial_noiseblend = 0.0
+    else:
+        # Neither inital, nor noiseblend is provided, falling back to random
+        # generated initial guess
+        if options.initial_noiseblend is None:
+            options.initial_noiseblend = 1.0
+        if options.initial_noiseblend < 1.0:
+            initial = content_image
 
-    if options.checkpoint_output and "%s" not in options.checkpoint_output:
-        parser.error("To save intermediate images, the checkpoint output "
-                     "parameter must contain `%s` (e.g. `foo%s.jpg`)")
+    # try saving a dummy image to the output path to make sure that it's writable
+    if os.path.isfile(options.output) and not options.overwrite:
+        raise IOError("%s already exists, will not replace it without "
+                      "the '--overwrite' flag" % options.output)
+    try:
+        imsave(options.output, np.zeros((500, 500, 3)))
+    except:
+        raise IOError('%s is not writable or does not have a valid file '
+                      'extension for an image file' % options.output)
 
+    loss_arrs = None
     for iteration, image in stylize(
         network=options.network,
         initial=initial,
@@ -143,12 +241,18 @@ def main():
 
 def imread(path):
     return imageio.imread(path).astype(np.float)
+    if len(img.shape) == 2:
+        # grayscale
+        img = np.dstack((img,img,img))
+    elif img.shape[2] == 4:
+        # PNG with alpha channel
+        img = img[:,:,:3]
+    return img
 
 
 def imsave(path, img):
     img = np.clip(img, 0, 255).astype(np.uint8)
-    imageio.imwrite(path, img)
-
+    Image.fromarray(img).save(path, quality=95)
 
 if __name__ == '__main__':
     main()
