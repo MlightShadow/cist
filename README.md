@@ -29,4 +29,6 @@ python neural_style.py --content content.jpg --styles style.jpg --output output.
 * `imageio.imread()` -> `scipy.misc.imread()`
 * `imageio.imsave()` -> `scipy.misc.imwrite()`
 
-另外 `scipy.misc.resize()` 也被废除了, 这边用`skimage`来替代, 不过`skimage`也需要使用`scikit-image`来替代了 `scikit-image` 包括 `imageio`
+另外 `scipy.misc.resize()` 也被废除了, 使用 `scikit-image`
+
+* `scipy.misc.resize()` -> `transform.rescale()`
